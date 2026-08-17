@@ -202,17 +202,13 @@ def suggest_filename(df_raw: pd.DataFrame) -> str:
     """
     Build a meaningful suggested output filename from the sample labels.
 
-    Pattern:  {ExperimentCode}-{TU?}_Cleaned_Usable_Data.xlsx
+    Pattern:  {ExperimentCode}-_Cleaned_Usable_Data.xlsx
 
     How the experiment code is found:
       Scans Sample-type labels for the pattern  WORD-digit
-      e.g. "BOZ-1 Yield 1"  →  code = "BOZ"
-           "POZO-2 Reject"  →  code = "POZO"
-           "Egypt-234-1 X"  →  code = "Egypt-234"
-
-    TU flag:
-      Added as "-TU" if any sample label contains the text "TU"
-      e.g. "TU Water" triggers it.
+      e.g. "BOZ-1 Sample"  →  code = "BOZ"
+           "POZO-2 Waste"  →  code = "POZO"
+           "UK-234-1 Unknown"  →  code = "UK-234"
 
     Falls back to "Cleaned_Usable_Data.xlsx" if nothing matches.
     """
