@@ -1,0 +1,354 @@
+"""
+utils.py
+────────
+Shared utility functions used across the whole application.
+
+  - Config load / save
+  - Error logging (friendly messages to user, full traceback to file)
+  - Tooltip widget
+  - Cross-platform open_path
+  - Smart filename suggestion
+  - Agilent file loading (CSV + Excel)
+  - Unit conversion and value cleaning
+  - Conversion history log
+"""
+
+import os
+import re
+import json
+import datetime
+import traceback
+import subprocess
+import platform
+import tkinter as tk
+
+import pandas as pd
+
+from constants import (
+    CONFIG_PATH, ERROR_LOG, CONV_LOG, CFG_DEFAULTS,
+    REQUIRED_COLS, F_SMALL, _OS,
+)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_config():
+    """Load saved settings. Falls back to defaults if file missing/corrupt."""
+    cfg = dict(CFG_DEFAULTS)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    """Write settings to disk. Silently ignores write errors."""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  ERROR LOGGING
+# ════════════════════════════════════════════════════════════════════════════
+
+def log_error(context: str, exc: Exception) -> str:
+    """
+    Write a full Python traceback to the error log file.
+    Returns a short, user-friendly string for display in the GUI.
+    The user never sees a raw traceback — it stays in the log file.
+    """
+    ts  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tb  = traceback.format_exc()
+    msg = f"\n[{ts}] {context}\n{tb}\n{'─'*60}\n"
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(msg)
+    except Exception:
+        pass
+    return (f"{context}: {type(exc).__name__} — {exc}\n"
+            f"(Full details saved to icp_cleaner_error.log)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  CONVERSION HISTORY LOG
+# ════════════════════════════════════════════════════════════════════════════
+
+def log_conversion(input_path: str, output_path: str,
+                   n_samples: int, n_elements: int,
+                   pdf_path: str = "", success: bool = True,
+                   note: str = ""):
+    """
+    Append one record to the persistent conversion log (JSON Lines format).
+    Each line is a self-contained JSON object — easy to parse, easy to read.
+
+    Fields written:
+        timestamp    — ISO datetime of the conversion
+        status       — "ok" or "failed"
+        input_file   — basename of the source ICP file
+        input_path   — full path
+        output_file  — basename of the Excel output
+        output_path  — full path
+        pdf_file     — basename of the PDF (empty string if not generated)
+        samples      — number of sample rows processed
+        elements     — number of element columns
+        note         — any free-text note (e.g. re-run handling used)
+    """
+    record = {
+        "timestamp":   datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status":      "ok" if success else "failed",
+        "input_file":  os.path.basename(input_path),
+        "input_path":  input_path,
+        "output_file": os.path.basename(output_path),
+        "output_path": output_path,
+        "pdf_file":    os.path.basename(pdf_path) if pdf_path else "",
+        "samples":     n_samples,
+        "elements":    n_elements,
+        "note":        note,
+    }
+    try:
+        with open(CONV_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
+def load_conversion_log() -> list:
+    """
+    Return all conversion records as a list of dicts, newest first.
+    Returns empty list if the log doesn't exist yet.
+    """
+    records = []
+    try:
+        with open(CONV_LOG, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except FileNotFoundError:
+        pass
+    return list(reversed(records))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  TOOLTIP  (hover help text for any Tkinter widget)
+# ════════════════════════════════════════════════════════════════════════════
+
+class Tooltip:
+    """
+    Attach a tooltip to any tkinter widget.
+    Shows on hover, hides when the mouse leaves.
+
+    Usage:
+        Tooltip(my_button, "Click here to process the file.")
+    """
+    def __init__(self, widget, text: str):
+        self.widget  = widget
+        self.text    = text
+        self.tip_win = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _=None):
+        if self.tip_win:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip_win = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(tw, text=self.text, justify="left",
+                 background="#FFFDE7", foreground="#333",
+                 relief="solid", borderwidth=1,
+                 font=F_SMALL, padx=6, pady=3).pack()
+
+    def _hide(self, _=None):
+        if self.tip_win:
+            self.tip_win.destroy()
+            self.tip_win = None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  OPEN FILE / FOLDER  (cross-platform)
+# ════════════════════════════════════════════════════════════════════════════
+
+def open_path(path: str):
+    """Open a file or folder in the OS default viewer / file manager."""
+    try:
+        if _OS == "Windows":
+            os.startfile(path)
+        elif _OS == "Darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SMART FILENAME SUGGESTION
+# ════════════════════════════════════════════════════════════════════════════
+
+def suggest_filename(df_raw: pd.DataFrame) -> str:
+    """
+    Build a meaningful suggested output filename from the sample labels.
+
+    Pattern:  {ExperimentCode}-{TU?}_Cleaned_Usable_Data.xlsx
+
+    How the experiment code is found:
+      Scans Sample-type labels for the pattern  WORD-digit
+      e.g. "BOZ-1 Yield 1"  →  code = "BOZ"
+           "POZO-2 Reject"  →  code = "POZO"
+           "Egypt-234-1 X"  →  code = "Egypt-234"
+
+    TU flag:
+      Added as "-TU" if any sample label contains the text "TU"
+      e.g. "TU Water" triggers it.
+
+    Falls back to "Cleaned_Usable_Data.xlsx" if nothing matches.
+    """
+    samples = (df_raw[df_raw["Type"] == "Sample"]["Label"]
+               .dropna().unique().tolist()
+               if "Type" in df_raw.columns else [])
+
+    exp_code = ""
+    for lbl in samples:
+        m = re.match(r'^([A-Za-z][A-Za-z0-9\-]*?)-(\d+)\b', str(lbl))
+        if m:
+            exp_code = m.group(1).rstrip("-")
+            break
+
+    has_tu = any("TU" in str(lbl).upper() for lbl in samples)
+
+    if exp_code:
+        stem = exp_code + ("-TU" if has_tu else "") + "_Cleaned_Usable_Data"
+    else:
+        stem = "Cleaned_Usable_Data"
+
+    return stem + ".xlsx"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  AGILENT FILE LOADING
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_agilent_file(path: str) -> pd.DataFrame:
+    """
+    Load an Agilent ICP export file (CSV or Excel).
+
+    Agilent puts 6 lines of metadata at the top of every export before the
+    real column headers start — this function skips those automatically.
+    All values are loaded as strings so nothing gets silently converted.
+    Trailing/leading whitespace is stripped from every text cell.
+    """
+    ext = path.lower().rsplit(".", 1)[-1]
+    kw  = dict(skiprows=6, header=0, dtype=str)
+
+    if ext == "csv":
+        df = pd.read_csv(path, **kw)
+    elif ext in ("xlsx", "xlsm"):
+        df = pd.read_excel(path, engine="openpyxl", **kw)
+    elif ext == "xls":
+        try:
+            df = pd.read_excel(path, engine="xlrd", **kw)
+        except Exception:
+            df = pd.read_excel(path, engine="openpyxl", **kw)
+    else:
+        # Unknown extension — try CSV first, then Excel
+        try:
+            df = pd.read_csv(path, **kw)
+        except Exception:
+            df = pd.read_excel(path, **kw)
+
+    # Strip invisible whitespace from every text cell
+    return df.apply(lambda c: c.str.strip() if c.dtype == object else c)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  UNIT CONVERSION + VALUE CLEANING
+# ════════════════════════════════════════════════════════════════════════════
+
+# Multiply by this factor to convert any unit → ppm (mg/L)
+_UNIT_TO_PPM = {
+    "ppm":   1.0,  "mg/l":  1.0,  "mg/kg": 1.0,
+    "ppb":   1e-3, "ug/l":  1e-3, "ug/kg": 1e-3,
+    "ppt":   1e-6, "ng/l":  1e-6,
+    "ratio": None,   # dimensionless — skip conversion
+}
+
+# Strings that mean "this measurement was outside the calibration range"
+_UNCAL_MARKERS = {"uncal", "-", "nan", "none", ""}
+
+
+def _is_uncal(val) -> bool:
+    return (str(val).strip().lower() in _UNCAL_MARKERS or
+            (not isinstance(val, str) and pd.isna(val)))
+
+
+def _to_float(s):
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def clean_value(val, uncal_mode: str,
+                from_unit: str = None,
+                target_unit: str = "Keep as-is"):
+    """
+    Convert one raw concentration cell to its final clean value.
+
+    Steps in order:
+      1. If the value is an Uncal marker → return per uncal_mode setting
+      2. If unit conversion is requested → convert to target unit
+      3. Cast to float if possible, otherwise leave as text
+    """
+    s = str(val).strip()
+
+    if _is_uncal(s):
+        return {
+            "keep_text": "Uncal",
+            "blank":     None,
+            "zero":      0,
+        }.get(uncal_mode, "Uncal")
+
+    fu     = (from_unit or "").strip().lower()
+    factor = _UNIT_TO_PPM.get(fu)
+    num    = _to_float(s)
+
+    if num is not None and factor is not None and target_unit != "Keep as-is":
+        ppm = num * factor
+        return (round(ppm * 1000, 6) if target_unit == "ppb (ug/L)"
+                else round(ppm, 6))
+
+    return num if num is not None else s
+
+
+def safe_avg(series):
+    """
+    Average the numeric values in a pandas Series.
+    Non-numeric items (like "Uncal") are collected separately;
+    if there are no numbers at all, return the first non-numeric value.
+    This way re-run averaging never crashes on mixed-type columns.
+    """
+    nums, text = [], []
+    for v in series:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        n = _to_float(v)
+        if n is not None:
+            nums.append(n)
+        else:
+            text.append(v)
+    if nums:
+        return round(sum(nums) / len(nums), 6)
+    return text[0] if text else None
